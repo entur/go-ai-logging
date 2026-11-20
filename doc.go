@@ -1,5 +1,8 @@
-// Package ailogging runs Go tests for AI coding agents: it keeps the complete
-// test output on disk and prints a short, bounded summary that points into it.
+// Package ailogging runs `go test -json` for AI coding agents: it keeps the
+// complete output in a private run directory and prints a short, bounded
+// summary that points into it.
 //
-// This module is pre-release and has no API yet; v0.1.0 is planned.
+// The command github.com/entur/go-ai-logging/cmd/ailog is the usual entry
+// point; [ParseArgs] and [Run] are what it calls. The output format, run
+// files and exit codes are specified in doc/contract.md.
 package ailogging
