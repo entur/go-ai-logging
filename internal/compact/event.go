@@ -31,8 +31,9 @@ type Event struct {
 	key            [sha256.Size]byte
 }
 
-// Parse recognises a JSON object with a "severity" or "level" string and a
-// "message" or "msg"; it returns nil for anything else.
+// Parse recognises a JSON object with a "severity" or "level" string (the
+// first present key must hold a JSON string, not null) and a "message" or
+// "msg" of any type; it returns nil for anything else.
 func Parse(text []byte) *Event {
 	trimmed := bytes.TrimSpace(text)
 	if !bytes.HasPrefix(trimmed, []byte("{")) {
@@ -44,7 +45,7 @@ func Parse(text []byte) *Event {
 	}
 	ev := &Event{fields: fields, sevKey: firstKey(fields, "severity", "level"), msgKey: firstKey(fields, "message", "msg")}
 	var sev string
-	if ev.sevKey == "" || ev.msgKey == "" || json.Unmarshal(fields[ev.sevKey], &sev) != nil {
+	if ev.sevKey == "" || ev.msgKey == "" || !isString(fields[ev.sevKey]) || json.Unmarshal(fields[ev.sevKey], &sev) != nil {
 		return nil
 	}
 	ev.label = severityLabel(sev)
@@ -205,10 +206,15 @@ func firstKey(fields map[string]json.RawMessage, keys ...string) string {
 	return ""
 }
 
+// isString reports a JSON string token; null and other types are not.
+func isString(raw json.RawMessage) bool {
+	return bytes.HasPrefix(bytes.TrimSpace(raw), []byte(`"`))
+}
+
 // jsonValue renders strings quoted and everything else as minified JSON, keeping numbers exact.
 func jsonValue(raw json.RawMessage) string {
 	var s string
-	if bytes.HasPrefix(bytes.TrimSpace(raw), []byte(`"`)) && json.Unmarshal(raw, &s) == nil {
+	if isString(raw) && json.Unmarshal(raw, &s) == nil {
 		return strconv.Quote(s)
 	}
 	var buf bytes.Buffer

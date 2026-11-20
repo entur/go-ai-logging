@@ -349,3 +349,24 @@ func TestEssentialsWithEmptyCandidatePools(t *testing.T) {
 		t.Errorf("%d CANDIDATES headers printed, want 30:\n%s", n, report)
 	}
 }
+
+// A null severity is not a structured event: the line stays text, so it is
+// kept in the failure excerpt.
+func TestNullSeverityStaysInFailureExcerpt(t *testing.T) {
+	for _, line := range []string{
+		`{"level":null,"msg":"ROOT-NULL-LEVEL: missing credential"}`,
+		`{"severity":null,"message":"ROOT-NULL-SEVERITY: missing credential"}`,
+	} {
+		input := ev("run", "p", "TestConfig", "") + ev("output", "p", "TestConfig", line+"\n") +
+			ev("output", "p", "TestConfig", "    x_test.go:9: generic assertion\n") +
+			ev("fail", "p", "TestConfig", "") + ev("fail", "p", "", "")
+		tc := newTestCapture(t, "")
+		report := tc.feed(t, input)
+		if !strings.Contains(report, "FAIL p TestConfig (#1..#2)\n  #1 "+line+"\n  #2     x_test.go:9: generic assertion\n") {
+			t.Errorf("report:\n%s", report)
+		}
+		if got := lines(tc.compact.String())[0]; !strings.HasPrefix(got, "#1 TXT p ?TestConfig ") {
+			t.Errorf("compact.log line = %q", got)
+		}
+	}
+}

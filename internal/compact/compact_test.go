@@ -41,7 +41,7 @@ func TestRenderEvent(t *testing.T) {
 			}
 		})
 	}
-	for _, line := range []string{`{"message":"no level"}`, `{"severity":"info"}`, `{"severity":1,"message":"m"}`, `not json`, `{"severity":"info","message":"m"} trailing`} {
+	for _, line := range []string{`{"message":"no level"}`, `{"severity":"info"}`, `{"severity":1,"message":"m"}`, `{"level":null,"msg":"m"}`, `{"severity":null,"message":"m"}`, `{"severity":null,"level":"warn","msg":"m"}`, `not json`, `{"severity":"info","message":"m"} trailing`} {
 		if Parse([]byte(line)) != nil {
 			t.Errorf("%s recognised as an event", line)
 		}
