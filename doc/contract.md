@@ -10,7 +10,7 @@ ailog [-ailog.out=PARENT | -ailog.out PARENT] [go test arguments...]
 
 - `-ailog.out` is consumed only before the first `-args`; the last one wins. Everything else, including `-args` and all that follows it, is forwarded verbatim and in order.
 - The child is `go test -json -count=1 ARGS...`, started without a shell, with `go` from `PATH` and the caller's environment and working directory. Later arguments override the defaults (`-count=2`, `-json=false`). `GOFLAGS` is not parsed and no flag is reserved.
-- An interrupt or `SIGTERM` does not stop `ailog`: it sends an interrupt to `go`, keeps reading, and kills `go` 10 seconds later if it is still running. A terminal's Ctrl-C reaches the test processes directly.
+- An interrupt or `SIGTERM` does not stop `ailog`: it sends an interrupt to `go`, keeps reading, and kills `go` 10 seconds later if it is still running. A terminal's Ctrl-C reaches the test processes directly; `ailog` does not signal them. Reading stops 0.25 seconds after the kill even if a process `go` started still holds stdout or stderr; the capture is then incomplete (`CAPTURE INCOMPLETE: cut off by cancellation: ...`).
 
 ## Exit codes
 
@@ -113,7 +113,7 @@ After the child exits, in this order:
    - `TESTS none observed (counts unavailable)` when test2json events arrived but no named test ran;
    - `TESTS none observed (counts unavailable: no test2json events)`, for example with `-json=false`.
 4. Diagnostics, in this section order:
-   1. `STDERR N lines` and the first 10 lines of `go.stderr`.
+   1. `STDERR N lines` and the first 10 lines of `go.stderr`, without IDs (stderr lines are not logical lines).
    2. `OUTPUT TAIL (no test2json events)` and the last 20 text lines, only without test2json events and with a non-zero `go_exit`.
    3. Per build failure: `BUILD FAIL IMPORTPATH` and its build output lines (30 at most over all builds).
    4. Per failed test, top-level or subtest, 5 at most: `FAIL PACKAGE TEST (#FIRST..#LAST)`; then `  (+K earlier lines, see full.log)` when lines were dropped, the last 8 text lines of the test (assertions, panics), and up to 8 `WRN`/`ERR`/`FTL`/`PNC` events with its hint. Then `... N more failed tests not shown (grep -e '--- FAIL' full.log)`.
@@ -132,7 +132,7 @@ After the child exits, in this order:
 
    The last line appears only if a line was truncated or had a gap; `S,E` locates the first one. The paths in the commands are POSIX-shell-quoted.
 
-Diagnostic body lines start with the logical line ID, `#N`, so that an agent can look it up with the drill-down command.
+Diagnostic body lines start with the logical line ID, `#N`, so that an agent can look it up with the drill-down command. The exceptions are the STDERR excerpt, which comes from `go.stderr`, and the notices (`(+K earlier lines ...)`, `(no WRN/ERR/FTL/PNC events)`, `... N more ...`).
 
 **Budget.** Diagnostics are at most 60 lines, followed by `... N more lines omitted (see compact.log)` when lines were left out. Essential lines are kept first, in section order: `BUILD FAIL` headers, `FAIL` headers, each `CANDIDATES` header with its first candidate, `CRASH` headlines and `incomplete:` lines. Other lines fill the rest of the budget in section order. Kept lines are printed in section order.
 
