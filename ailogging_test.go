@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/entur/go-ai-logging/internal/capture"
+	"github.com/entur/go-ai-logging/internal/escape"
 )
 
 type fixtureRun struct {
@@ -404,5 +407,123 @@ func TestIntegrationCancelEndsRun(t *testing.T) {
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("Run did not return after cancel")
+	}
+}
+
+// shellGo writes an executable sh script to use as Config.GoCommand.
+func shellGo(t *testing.T, script string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("needs sh")
+	}
+	p := filepath.Join(t.TempDir(), "fake-go")
+	if err := os.WriteFile(p, []byte("#!/bin/sh\n"+script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s not created", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// cancelWhenReady runs cfg, cancels once ready exists and returns the result
+// with the time Run took after the cancellation.
+func cancelWhenReady(t *testing.T, cfg Config, ready string) (Result, time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan Result, 1)
+	go func() { done <- Run(ctx, cfg) }()
+	waitForFile(t, ready)
+	start := time.Now()
+	cancel()
+	select {
+	case res := <-done:
+		return res, time.Since(start)
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run did not return after cancel")
+		return Result{}, 0
+	}
+}
+
+func expectCutOff(t *testing.T, res Result, took time.Duration, out fmt.Stringer) {
+	t.Helper()
+	if took > 100*time.Millisecond+killDrain+time.Second {
+		t.Errorf("Run returned %s after cancel, wait delay 100ms", took)
+	}
+	if res.ExitCode != ExitFailure || res.Err == nil || !strings.Contains(res.Err.Error(), "cut off by cancellation") ||
+		!strings.Contains(out.String(), "\nCAPTURE INCOMPLETE: cut off by cancellation: ") {
+		t.Errorf("%+v:\n%s", res, out)
+	}
+}
+
+// A descendant that outlives the wait delay keeps the pipes open; the
+// capture is cut off instead of waiting for it.
+func TestCancelCutsOffInheritedPipes(t *testing.T) {
+	t.Parallel()
+	ready := filepath.Join(t.TempDir(), "ready")
+	goCmd := shellGo(t, "trap 'exit 0' INT\nsleep 5 &\necho ready > "+escape.ShellQuote(ready)+"\nwhile :; do sleep 0.1; done\n")
+	out := &syncBuffer{}
+	res, took := cancelWhenReady(t, Config{GoCommand: goCmd, OutParent: t.TempDir(), Stdout: out, waitDelay: 100 * time.Millisecond}, ready)
+	expectCutOff(t, res, took, out)
+}
+
+// The same with a real go test behind a wrapper that runs go in the background.
+func TestIntegrationCancelWrappedGo(t *testing.T) {
+	integration(t)
+	module := t.TempDir()
+	ready := filepath.Join(module, "ready")
+	src := fmt.Sprintf(`package hold
+
+import (
+	"os"
+	"testing"
+	"time"
+)
+
+func TestHold(t *testing.T) {
+	if err := os.WriteFile(%q, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Second)
+}
+`, ready)
+	for name, content := range map[string]string{"go.mod": "module example.com/hold\n\ngo 1.26.0\n", "hold_test.go": src} {
+		if err := os.WriteFile(filepath.Join(module, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	goCmd := shellGo(t, "go \"$@\" &\nwait\n")
+	out := &syncBuffer{}
+	cfg := Config{GoCommand: goCmd, Args: []string{"./..."}, Dir: module, OutParent: t.TempDir(), Stdout: out, waitDelay: 100 * time.Millisecond}
+	res, took := cancelWhenReady(t, cfg, ready)
+	expectCutOff(t, res, took, out)
+}
+
+// Without cancellation, output a descendant writes after the go command
+// exited is still read to EOF.
+func TestDescendantOutputAfterExitIsCaptured(t *testing.T) {
+	t.Parallel()
+	late := `{"Action":"output","Package":"p","Output":"late line\n"}`
+	goCmd := shellGo(t, "(sleep 0.3; printf '%s\\n' "+escape.ShellQuote(late)+") &\nexit 0\n")
+	var out bytes.Buffer
+	res := Run(t.Context(), Config{GoCommand: goCmd, OutParent: t.TempDir(), Stdout: &out, waitDelay: 100 * time.Millisecond})
+	if res.ExitCode != 0 || res.Err != nil {
+		t.Fatalf("%+v:\n%s", res, out.String())
+	}
+	full, err := os.ReadFile(filepath.Join(res.RunDir, capture.FullFile))
+	if err != nil || string(full) != "#1 p ?- late line\n" {
+		t.Errorf("full.log = %q, %v", full, err)
 	}
 }

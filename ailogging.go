@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/entur/go-ai-logging/internal/capture"
@@ -29,6 +30,9 @@ const (
 	// waitDelay is how long the go command gets after ctx is done before it
 	// is killed.
 	waitDelay = 10 * time.Second
+	// killDrain is how long the capture keeps reading after the go command
+	// was killed, for the EOF that follows when no descendant holds a pipe.
+	killDrain = 250 * time.Millisecond
 )
 
 // Config describes one run. The zero value runs `go test -json -count=1` in
@@ -99,9 +103,11 @@ func ParseArgs(args []string) (Config, error) {
 // Run creates a private run directory, runs `go test -json -count=1
 // cfg.Args...`, writes the run files and prints the summary to cfg.Stdout.
 // When ctx is done, the go command is sent an interrupt and killed if it has
-// not exited 10 seconds later. The go command itself waits for its test
-// processes, which get a terminal's Ctrl-C directly; killing it ends the
-// capture but does not signal test processes it started.
+// not exited 10 seconds later. A quarter of a second after that the capture
+// stops reading, even if a process the go command started still holds its
+// stdout or stderr: Result.Err then says the capture was cut off by cancellation and
+// ExitCode is ExitFailure. Processes the go command started are not
+// signalled; a terminal's Ctrl-C reaches them directly.
 func Run(ctx context.Context, cfg Config) Result {
 	out := cmp.Or[io.Writer](cfg.Stdout, os.Stdout)
 	create := cfg.create
@@ -144,41 +150,44 @@ func Run(ctx context.Context, cfg Config) Result {
 		}
 		return nil
 	}
-	cmd.WaitDelay = cmp.Or(cfg.waitDelay, waitDelay)
-	stdout, err := cmd.StdoutPipe()
-	if err == nil {
-		var stderr io.ReadCloser
-		stderr, err = cmd.StderrPipe()
-		if err == nil {
-			err = cmd.Start()
-		}
-		if err == nil {
-			return finish(cmd, stdout, stderr, sinks, failure, out, cfg.Dir, res)
-		}
+	grace := cmp.Or(cfg.waitDelay, waitDelay)
+	cmd.WaitDelay = grace
+	p, err := startPiped(cmd)
+	if err != nil {
+		closeSinks(sinks)
+		return fail("start %s: %w", goCmd, err)
 	}
-	closeSinks(sinks)
-	return fail("start %s: %w", goCmd, err)
-}
+	cut, stopWatch := p.cutAfter(ctx, grace)
+	readErr := func(name string, r io.Reader, err error) {
+		if cut.Load() && (errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, os.ErrClosed)) {
+			failure.Set(fmt.Errorf("cut off by cancellation: %s still open %v after ctx was done", name, grace+killDrain))
+			return
+		}
+		failure.Set(fmt.Errorf("read %s: %w", name, err))
+		_, _ = io.Copy(io.Discard, r) // keep the child from blocking on a full pipe
+	}
 
-// finish drains both pipes to EOF whatever happens to the files, waits for
-// the go command and prints the summary.
-func finish(cmd *exec.Cmd, stdout, stderr io.Reader, sinks map[string]*capture.Sink, failure *capture.Latch, out io.Writer, dir string, res Result) Result {
+	// Read both pipes to EOF whatever happens to the files; only then wait.
 	head := &summary.Head{}
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		if err := stream.Frame(stderr, sinks[capture.StderrFile].Tee, summary.MaxLine, head.Add); err != nil {
-			failure.Set(fmt.Errorf("read stderr: %w", err))
-			_, _ = io.Copy(io.Discard, stderr) // keep the child from blocking on a full pipe
+		if err := stream.Frame(p.stderr, sinks[capture.StderrFile].Tee, summary.MaxLine, head.Add); err != nil {
+			readErr("stderr", p.stderr, err)
 		}
 	})
-
-	c := capture.New(sinks[capture.RawFile], sinks[capture.FullFile], sinks[capture.CompactFile], cwdPrefix(dir))
-	if err := c.Consume(stdout); err != nil {
-		failure.Set(fmt.Errorf("read stdout: %w", err))
-		_, _ = io.Copy(io.Discard, stdout) // keep the child from blocking on a full pipe
+	c := capture.New(sinks[capture.RawFile], sinks[capture.FullFile], sinks[capture.CompactFile], cwdPrefix(cfg.Dir))
+	if err := c.Consume(p.stdout); err != nil {
+		readErr("stdout", p.stdout, err)
 	}
 	wg.Wait()
+	stopWatch()
+	p.close()
+	return finish(cmd, c, head, sinks, failure, out, res)
+}
 
+// finish waits for the go command after its output is read and prints the
+// summary.
+func finish(cmd *exec.Cmd, c *capture.Capture, head *summary.Head, sinks map[string]*capture.Sink, failure *capture.Latch, out io.Writer, res Result) Result {
 	res.GoExit = 0
 	if err := cmd.Wait(); err != nil {
 		var exitErr *exec.ExitError
@@ -207,6 +216,80 @@ func finish(cmd *exec.Cmd, stdout, stderr io.Reader, sinks map[string]*capture.S
 		res.ExitCode = ExitFailure
 	}
 	return res
+}
+
+// childPipes are the parent's read ends of the go command's stdout and
+// stderr. Its write ends are *os.File, so exec starts no copying goroutines,
+// and the parent closes its copies after Start: EOF then means every process
+// holding a write end has closed it.
+type childPipes struct {
+	stdout, stderr *os.File
+}
+
+func startPiped(cmd *exec.Cmd) (childPipes, error) {
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		return childPipes{}, err
+	}
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		closeFiles(outR, outW)
+		return childPipes{}, err
+	}
+	cmd.Stdout, cmd.Stderr = outW, errW
+	err = cmd.Start()
+	closeFiles(outW, errW) // the child has its own copies
+	if err != nil {
+		closeFiles(outR, errR)
+		return childPipes{}, err
+	}
+	return childPipes{stdout: outR, stderr: errR}, nil
+}
+
+// cutAfter ends both reads once grace (when the go command is killed) and
+// killDrain have elapsed after ctx is done, even if a descendant of the go
+// command still holds a write end. cut reports that the deadline was set;
+// stop ends the watch and returns after it has.
+func (p childPipes) cutAfter(ctx context.Context, grace time.Duration) (cut *atomic.Bool, stop func()) {
+	cut = &atomic.Bool{}
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		select {
+		case <-ctx.Done():
+		case <-done:
+			return
+		}
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-done:
+			return
+		}
+		cut.Store(true)
+		deadline := time.Now().Add(killDrain)
+		for _, f := range []*os.File{p.stdout, p.stderr} {
+			if f.SetReadDeadline(deadline) != nil {
+				_ = f.Close() // pipes without deadline support: closing ends the read
+			}
+		}
+	})
+	return cut, func() {
+		close(done)
+		wg.Wait()
+	}
+}
+
+func (p childPipes) close() {
+	closeFiles(p.stdout, p.stderr)
+}
+
+// closeFiles closes pipe ends; their close errors carry no data.
+func closeFiles(files ...*os.File) {
+	for _, f := range files {
+		_ = f.Close()
+	}
 }
 
 // createFile creates one of the fixed file names in the new private run dir;
